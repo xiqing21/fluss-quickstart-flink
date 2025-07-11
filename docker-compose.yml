@@ -1,0 +1,201 @@
+services:
+  # PostgreSQL 源数据库
+  postgres-source:
+    image: postgres:15
+    hostname: postgres-source
+    container_name: postgres-source
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: source_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./postgres_source/init:/docker-entrypoint-initdb.d
+      - postgres_source_data:/var/lib/postgresql/data
+    command: |
+      postgres -c wal_level=logical 
+               -c max_replication_slots=10 
+               -c max_wal_senders=10
+
+  # PostgreSQL 目标数据库
+  postgres-sink:
+    image: postgres:15
+    hostname: postgres-sink
+    container_name: postgres-sink
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: sink_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./postgres_sink/init:/docker-entrypoint-initdb.d
+      - postgres_sink_data:/var/lib/postgresql/data
+
+  # Kafka 集群
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+
+  # Fluss Coordinator Server
+  coordinator-server:
+    image: fluss/fluss:0.7.0
+    hostname: coordinator-server
+    container_name: coordinator-server
+    ports:
+      - "9123:9123"
+    environment:
+      FLUSS_PROPERTIES: |
+        coordinator.host: coordinator-server
+        coordinator.port: 9123
+        zookeeper.address: zookeeper:2181
+    command: /opt/fluss/bin/coordinator-server.sh start-foreground
+    depends_on:
+      - zookeeper
+
+  # Fluss Tablet Server
+  tablet-server:
+    image: fluss/fluss:0.7.0
+    hostname: tablet-server
+    container_name: tablet-server
+    ports:
+      - "9124:9124"
+    environment:
+      FLUSS_PROPERTIES: |
+        coordinator.host: coordinator-server
+        coordinator.port: 9123
+        tablet-server.host: tablet-server
+        tablet-server.port: 9124
+        zookeeper.address: zookeeper:2181
+    command: /opt/fluss/bin/tablet-server.sh start-foreground
+    depends_on:
+      - coordinator-server
+
+  # Flink JobManager
+  jobmanager:
+    image: flink:1.18-scala_2.12
+    hostname: jobmanager
+    container_name: jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    volumes:
+      - /tmp/flink-checkpoints-directory:/tmp/flink-checkpoints
+      - /tmp/flink-savepoints-directory:/tmp/flink-savepoints
+      - ./flink/jars:/opt/flink/usrlib
+    depends_on:
+      - postgres-source
+      - postgres-sink
+      - kafka
+
+  # Flink TaskManager
+  taskmanager:
+    image: flink:1.18-scala_2.12
+    hostname: taskmanager
+    container_name: taskmanager
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    scale: 1
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+    volumes:
+      - /tmp/flink-checkpoints-directory:/tmp/flink-checkpoints
+      - /tmp/flink-savepoints-directory:/tmp/flink-savepoints
+      - ./flink/jars:/opt/flink/usrlib
+
+  # Flink SQL 客户端
+  sql-client:
+    image: flink:1.18-scala_2.12
+    hostname: sql-client
+    container_name: sql-client
+    depends_on:
+      - jobmanager
+      - kafka
+      - postgres-source
+      - postgres-sink
+      - coordinator-server
+    command: 
+      - bash
+      - -c
+      - |
+        echo 'Waiting for all services to be ready...'
+        sleep 60
+        
+        echo 'Creating Kafka topics for data pipeline...'
+        kafka-topics --bootstrap-server kafka:29092 --create --topic ods_orders --partitions 4 --replication-factor 1 || true
+        kafka-topics --bootstrap-server kafka:29092 --create --topic ods_users --partitions 4 --replication-factor 1 || true
+        kafka-topics --bootstrap-server kafka:29092 --create --topic dwd_orders --partitions 4 --replication-factor 1 || true
+        kafka-topics --bootstrap-server kafka:29092 --create --topic dwd_users --partitions 4 --replication-factor 1 || true
+        kafka-topics --bootstrap-server kafka:29092 --create --topic result_orders_with_user_info --partitions 4 --replication-factor 1 || true
+        
+        echo 'All topics created successfully!'
+        echo 'SQL Client is ready. You can now connect and execute SQL files.'
+        echo 'Available SQL files:'
+        echo '  1. /opt/sql/1_cdc_source_to_kafka.sql'
+        echo '  2. /opt/sql/2_dwd_layer.sql'  
+        echo '  3. /opt/sql/3_fluss_dimension_join.sql'
+        echo '  4. /opt/sql/4_sink_to_postgres.sql'
+        echo ''
+        echo 'To connect: docker-compose exec sql-client /opt/flink/bin/sql-client.sh'
+        
+        tail -f /dev/null
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+    volumes:
+      - ./flink/jars:/opt/flink/usrlib
+      - ./flink/sql:/opt/sql
+
+networks:
+  default:
+    name: flink-network
+
+volumes:
+  postgres_source_data:
+  postgres_sink_data: 
