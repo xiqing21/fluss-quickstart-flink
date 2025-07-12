@@ -1,6 +1,5 @@
--- ========================================
--- 第二步：DWD 层数据处理和转换
--- ========================================
+-- 修复后的第二步：DWD 层数据处理和转换
+-- 使用普通 kafka 连接器读取，upsert-kafka 写入
 
 -- 读取 ODS 层订单数据
 CREATE TABLE ods_orders_source (
@@ -13,32 +12,12 @@ CREATE TABLE ods_orders_source (
     total_amount DECIMAL(10,2),
     order_status STRING,
     order_time TIMESTAMP(3),
-    updated_at TIMESTAMP(3),
-    PRIMARY KEY (order_id) NOT ENFORCED
+    updated_at TIMESTAMP(3)
 ) WITH (
     'connector' = 'kafka',
     'topic' = 'ods_orders',
     'properties.bootstrap.servers' = 'kafka:29092',
     'properties.group.id' = 'dwd_orders_consumer_group',
-    'scan.startup.mode' = 'earliest-offset',
-    'format' = 'json'
-);
-
--- 读取 ODS 层用户数据
-CREATE TABLE ods_users_source (
-    user_id BIGINT,
-    username STRING,
-    email STRING,
-    phone STRING,
-    city STRING,
-    register_time TIMESTAMP(3),
-    updated_at TIMESTAMP(3),
-    PRIMARY KEY (user_id) NOT ENFORCED
-) WITH (
-    'connector' = 'kafka',
-    'topic' = 'ods_users',
-    'properties.bootstrap.servers' = 'kafka:29092',
-    'properties.group.id' = 'dwd_users_consumer_group',
     'scan.startup.mode' = 'earliest-offset',
     'format' = 'json'
 );
@@ -63,35 +42,11 @@ CREATE TABLE dwd_orders_topic (
     etl_time TIMESTAMP(3),             -- ETL 处理时间
     PRIMARY KEY (order_id) NOT ENFORCED
 ) WITH (
-    'connector' = 'kafka',
+    'connector' = 'upsert-kafka',
     'topic' = 'dwd_orders',
     'properties.bootstrap.servers' = 'kafka:29092',
-    'properties.group.id' = 'dwd_orders_producer_group',
-    'format' = 'json'
-);
-
--- 创建 DWD 层用户表（数据清洗和转换后）
-CREATE TABLE dwd_users_topic (
-    user_id BIGINT,
-    username STRING,
-    email STRING,
-    email_domain STRING,              -- 邮箱域名
-    phone STRING,
-    phone_area_code STRING,           -- 手机区号
-    city STRING,
-    city_tier STRING,                 -- 城市级别
-    register_time TIMESTAMP(3),
-    register_date STRING,             -- 注册日期
-    user_age_days INT,                -- 用户注册天数
-    updated_at TIMESTAMP(3),
-    etl_time TIMESTAMP(3),            -- ETL 处理时间
-    PRIMARY KEY (user_id) NOT ENFORCED
-) WITH (
-    'connector' = 'kafka',
-    'topic' = 'dwd_users',
-    'properties.bootstrap.servers' = 'kafka:29092',
-    'properties.group.id' = 'dwd_users_producer_group',
-    'format' = 'json'
+    'key.format' = 'json',
+    'value.format' = 'json'
 );
 
 -- DWD 层订单数据处理和写入
@@ -122,7 +77,7 @@ SELECT
     END as order_status_desc,
     order_time,
     DATE_FORMAT(order_time, 'yyyy-MM-dd') as order_date,
-    HOUR(order_time) as order_hour,
+    CAST(HOUR(order_time) AS INT) as order_hour,
     updated_at,
     CURRENT_TIMESTAMP as etl_time
 FROM ods_orders_source

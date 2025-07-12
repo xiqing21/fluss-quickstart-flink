@@ -1,8 +1,8 @@
 -- ========================================
--- 第四步：将最终结果写入 PostgreSQL 目标数据库
+-- 第四步：将最终结果写入 PostgreSQL 目标数据库（资源优化版）
 -- ========================================
 
--- 读取最终结果 Kafka Topic
+-- 读取最终结果 Kafka Topic（移除主键约束）
 CREATE TABLE result_source (
     order_id BIGINT,
     user_id BIGINT,
@@ -24,8 +24,7 @@ CREATE TABLE result_source (
     order_hour INT,
     user_register_time TIMESTAMP(3),
     user_city_tier STRING,
-    join_time TIMESTAMP(3),
-    PRIMARY KEY (order_id) NOT ENFORCED
+    join_time TIMESTAMP(3)
 ) WITH (
     'connector' = 'kafka',
     'topic' = 'result_orders_with_user_info',
@@ -35,7 +34,7 @@ CREATE TABLE result_source (
     'format' = 'json'
 );
 
--- 创建 PostgreSQL Sink 表
+-- 创建 PostgreSQL Sink 表（优化并行度）
 CREATE TABLE orders_with_user_info_sink (
     order_id BIGINT,
     user_id BIGINT,
@@ -66,6 +65,9 @@ CREATE TABLE orders_with_user_info_sink (
     'sink.max-retries' = '3',
     'sink.parallelism' = '1'
 );
+
+-- 设置全局并行度为 1 以节省资源
+SET 'parallelism.default' = '1';
 
 -- 将最终结果写入 PostgreSQL
 INSERT INTO orders_with_user_info_sink
