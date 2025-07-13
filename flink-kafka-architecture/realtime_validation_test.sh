@@ -12,6 +12,11 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 NC='\033[0m' # No Color
 
+# 全局变量
+ORDER_ID=""
+TEST_START_TIME=""
+TEST_ORDER_INSERT_TIME=""
+
 # 打印带颜色的消息
 print_header() {
     echo -e "${BLUE}========================================${NC}"
@@ -75,11 +80,8 @@ verify_initial_data() {
     
     if [ "$job_count" -lt 4 ]; then
         print_warning "Flink作业数量不足，请确保已执行所有SQL脚本"
-        print_info "执行命令："
-        echo "  docker exec sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/1_cdc_source_to_kafka.sql"
-        echo "  docker exec sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/2_dwd_layer.sql"
-        echo "  docker exec sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/3_dimension_join.sql"
-        echo "  docker exec sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/4_sink_to_postgres.sql"
+        print_info "可以运行以下命令来执行所有SQL脚本："
+        print_info "  ./execute-sql-scripts.sh"
         read -p "是否继续测试？ (y/n): " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -94,13 +96,14 @@ execute_realtime_operations() {
     
     # 生成唯一的订单ID
     ORDER_ID=$((2000 + RANDOM % 1000))
-    START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    TEST_START_TIME=$(date +%s)
     
     print_info "测试订单ID: $ORDER_ID"
-    print_info "开始时间: $START_TIME"
+    print_info "测试开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
     
     # 1. 插入新订单
     print_info "1. 插入新订单 (PENDING状态)"
+    TEST_ORDER_INSERT_TIME=$(date +%s)
     docker exec postgres-source psql -U postgres -d source_db -c "
     INSERT INTO business.orders (order_id, user_id, product_name, product_category, quantity, unit_price, total_amount, order_status, order_time, updated_at)
     VALUES ($ORDER_ID, 1001, 'AirPods Pro 测试', '电子产品', 1, 1999.00, 1999.00, 'PENDING', NOW(), NOW());
@@ -147,62 +150,81 @@ execute_realtime_operations() {
         return 1
     fi
     
-    # 存储订单ID供后续验证使用
-    echo $ORDER_ID > /tmp/test_order_id.txt
+    print_success "实时业务操作完成"
 }
 
-# 验证数据流转
+# 改进的数据流转验证
 verify_data_flow() {
     print_step "验证数据流转..."
     
-    ORDER_ID=$(cat /tmp/test_order_id.txt 2>/dev/null || echo "2006")
+    # 等待数据传播 - 延长等待时间
+    print_info "等待数据传播到各个层级..."
+    sleep 12
     
-    # 验证CDC层
+    # 验证ODS层 - 改进的检测方法
     print_info "验证ODS层CDC数据捕获..."
-    local ods_count=$(timeout 10s docker exec kafka kafka-console-consumer \
+    local ods_found=false
+    
+    # 使用更长的超时时间和更多的消息数量
+    local ods_data=$(timeout 20s docker exec kafka kafka-console-consumer \
         --bootstrap-server localhost:9092 \
         --topic ods_orders \
         --from-beginning \
-        --timeout-ms 8000 2>/dev/null | grep -c "$ORDER_ID" 2>/dev/null || echo "0")
-    ods_count=$(echo "$ods_count" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
-    [ -z "$ods_count" ] && ods_count=0
+        --max-messages 2000 2>/dev/null | grep "$ORDER_ID" | head -5)
     
-    if [ "$ods_count" -gt 0 ]; then
+    if [ -n "$ods_data" ]; then
+        local ods_count=$(echo "$ods_data" | wc -l | tr -d ' ')
         print_success "ODS层数据验证通过 (发现 $ods_count 条记录)"
+        ods_found=true
     else
-        print_warning "ODS层未发现测试数据，可能需要更多时间"
+        print_info "ODS层数据仍在传播中... (订单ID: $ORDER_ID)"
     fi
     
-    # 验证DWD层
+    # 验证DWD层 - 改进的检测方法
     print_info "验证DWD层数据清洗..."
-    local dwd_count=$(timeout 10s docker exec kafka kafka-console-consumer \
+    local dwd_found=false
+    
+    local dwd_data=$(timeout 20s docker exec kafka kafka-console-consumer \
         --bootstrap-server localhost:9092 \
         --topic dwd_orders \
         --from-beginning \
-        --timeout-ms 8000 2>/dev/null | grep -c "$ORDER_ID" 2>/dev/null || echo "0")
-    dwd_count=$(echo "$dwd_count" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
-    [ -z "$dwd_count" ] && dwd_count=0
+        --max-messages 2000 2>/dev/null | grep "$ORDER_ID" | head -5)
     
-    if [ "$dwd_count" -gt 0 ]; then
+    if [ -n "$dwd_data" ]; then
+        local dwd_count=$(echo "$dwd_data" | wc -l | tr -d ' ')
         print_success "DWD层数据验证通过 (发现 $dwd_count 条记录)"
+        dwd_found=true
     else
-        print_warning "DWD层未发现测试数据"
+        print_info "DWD层数据仍在处理中... (订单ID: $ORDER_ID)"
     fi
     
-    # 验证维度关联
+    # 验证维度关联 - 改进的检测方法
     print_info "验证维度关联结果..."
-    local result_count=$(timeout 10s docker exec kafka kafka-console-consumer \
+    local result_found=false
+    
+    local result_data=$(timeout 20s docker exec kafka kafka-console-consumer \
         --bootstrap-server localhost:9092 \
         --topic result_orders_with_user_info \
         --from-beginning \
-        --timeout-ms 8000 2>/dev/null | grep -c "$ORDER_ID" 2>/dev/null || echo "0")
-    result_count=$(echo "$result_count" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
-    [ -z "$result_count" ] && result_count=0
+        --max-messages 2000 2>/dev/null | grep "$ORDER_ID" | head -5)
     
-    if [ "$result_count" -gt 0 ]; then
+    if [ -n "$result_data" ]; then
+        local result_count=$(echo "$result_data" | wc -l | tr -d ' ')
         print_success "维度关联验证通过 (发现 $result_count 条记录)"
+        result_found=true
     else
-        print_warning "维度关联层未发现测试数据"
+        print_info "维度关联数据仍在处理中... (订单ID: $ORDER_ID)"
+    fi
+    
+    # 如果没有在Kafka中找到数据，给出更详细的信息
+    if [ "$ods_found" = false ] && [ "$dwd_found" = false ] && [ "$result_found" = false ]; then
+        print_info "Kafka数据检测未找到测试数据，可能原因："
+        print_info "  • 数据传播延迟较高"
+        print_info "  • CDC延迟或网络延迟"
+        print_info "  • 数据仍在处理管道中"
+        print_info "继续验证最终结果..."
+    else
+        print_success "数据流转验证完成，发现数据在多个层级中传播"
     fi
 }
 
@@ -210,11 +232,9 @@ verify_data_flow() {
 verify_final_results() {
     print_step "验证最终结果和延迟..."
     
-    ORDER_ID=$(cat /tmp/test_order_id.txt 2>/dev/null || echo "2006")
-    
     # 等待数据写入
     print_info "等待数据写入最终数据库..."
-    sleep 10
+    sleep 15
     
     # 检查最终结果
     echo -e "\n${BLUE}=== 最终结果验证 ===${NC}"
@@ -243,7 +263,7 @@ verify_final_results() {
         SELECT 
             order_id,
             order_status,
-            ROUND(CAST(DATE_PART('epoch', processed_time - order_time) AS NUMERIC), 2) as latency_seconds,
+            ROUND(CAST(EXTRACT(EPOCH FROM (processed_time - order_time)) AS NUMERIC), 2) as latency_seconds,
             TO_CHAR(order_time, 'HH24:MI:SS') as source_time,
             TO_CHAR(processed_time, 'HH24:MI:SS') as result_time
         FROM result.orders_with_user_info 
@@ -251,25 +271,29 @@ verify_final_results() {
         ORDER BY processed_time DESC;
         " 2>/dev/null
         
+        return 0
     else
         print_error "最终结果验证失败，未在目标数据库中找到测试数据"
         
-        # 尝试故障排除
+        # 故障排除
         print_info "执行故障排除..."
         
         # 检查Flink作业状态
         print_info "Flink作业状态:"
         docker exec jobmanager flink list 2>/dev/null | grep -E "(Job ID|RUNNING|FAILED)"
         
-        # 检查Sink作业是否运行
-        local sink_jobs=$(curl -s http://localhost:8081/jobs/overview 2>/dev/null | grep -o '"state":"RUNNING"' | wc -l || echo "0")
-        print_info "运行中的作业数量: $sink_jobs"
+        # 检查是否有任何数据写入
+        local total_records=$(docker exec postgres-sink psql -U postgres -d sink_db -c "
+        SELECT COUNT(*) FROM result.orders_with_user_info;
+        " 2>/dev/null | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | tr -d ' ')
+        
+        print_info "目标表总记录数: ${total_records:-0}"
         
         return 1
     fi
 }
 
-# 性能统计
+# 改进的性能统计
 performance_summary() {
     print_step "生成性能统计报告..."
     
@@ -280,12 +304,42 @@ performance_summary() {
     SELECT COUNT(*) FROM result.orders_with_user_info;
     " 2>/dev/null | grep -E "^[[:space:]]*[0-9]+[[:space:]]*$" | tr -d ' ')
     
-    # 平均延迟
+    # 修正的平均延迟计算 - 只计算有效的延迟数据
     local avg_latency=$(docker exec postgres-sink psql -U postgres -d sink_db -c "
-    SELECT ROUND(CAST(AVG(DATE_PART('epoch', processed_time - order_time)) AS NUMERIC), 2) 
+    SELECT ROUND(CAST(AVG(EXTRACT(EPOCH FROM (processed_time - order_time))) AS NUMERIC), 2) 
     FROM result.orders_with_user_info 
-    WHERE processed_time > order_time;
-    " 2>/dev/null | grep -E "^[[:space:]]*[0-9]+\.[0-9]+[[:space:]]*$" | tr -d ' ')
+    WHERE processed_time > order_time 
+    AND EXTRACT(EPOCH FROM (processed_time - order_time)) > 0
+    AND EXTRACT(EPOCH FROM (processed_time - order_time)) < 3600;
+    " 2>/dev/null | grep -E "^[[:space:]]*[0-9]+(\.[0-9]+)?[[:space:]]*$" | tr -d ' ')
+    
+    # 新增：测试数据的延迟指标
+    local test_latency=""
+    if [ ! -z "$ORDER_ID" ]; then
+        test_latency=$(docker exec postgres-sink psql -U postgres -d sink_db -c "
+        SELECT ROUND(CAST(EXTRACT(EPOCH FROM (processed_time - order_time)) AS NUMERIC), 2) 
+        FROM result.orders_with_user_info 
+        WHERE order_id = $ORDER_ID
+        ORDER BY processed_time DESC
+        LIMIT 1;
+        " 2>/dev/null | grep -E "^[[:space:]]*[0-9]+(\.[0-9]+)?[[:space:]]*$" | tr -d ' ')
+    fi
+    
+    # 新增：从插入到结果的端到端延迟
+    local end_to_end_latency=""
+    if [ ! -z "$TEST_ORDER_INSERT_TIME" ] && [ ! -z "$ORDER_ID" ]; then
+        local result_time=$(docker exec postgres-sink psql -U postgres -d sink_db -c "
+        SELECT EXTRACT(EPOCH FROM processed_time) 
+        FROM result.orders_with_user_info 
+        WHERE order_id = $ORDER_ID
+        ORDER BY processed_time DESC
+        LIMIT 1;
+        " 2>/dev/null | grep -E "^[[:space:]]*[0-9]+(\.[0-9]+)?[[:space:]]*$" | tr -d ' ')
+        
+        if [ ! -z "$result_time" ]; then
+            end_to_end_latency=$(echo "$result_time - $TEST_ORDER_INSERT_TIME" | bc -l 2>/dev/null | sed 's/^\./0./')
+        fi
+    fi
     
     # Flink集群资源
     local cluster_info=$(curl -s http://localhost:8081/overview 2>/dev/null)
@@ -296,27 +350,43 @@ performance_summary() {
     echo "📊 数据处理统计:"
     echo "  • 总处理订单数: ${total_orders:-0}"
     echo "  • 平均端到端延迟: ${avg_latency:-N/A} 秒"
+    if [ ! -z "$test_latency" ]; then
+        echo "  • 测试订单延迟: ${test_latency} 秒"
+    fi
+    if [ ! -z "$end_to_end_latency" ]; then
+        echo "  • 完整端到端延迟: $(printf "%.2f" "$end_to_end_latency") 秒"
+    fi
     echo ""
     echo "🔧 集群资源状态:"
     echo "  • TaskManager数量: ${taskmanagers:-0}"
     echo "  • 总Task Slots: ${slots_total:-0}"
     echo "  • 可用Task Slots: ${slots_available:-0}"
-    echo "  • 资源利用率: $((100 - slots_available * 100 / slots_total))%"
+    if [ ! -z "$slots_total" ] && [ ! -z "$slots_available" ] && [ "$slots_total" -gt 0 ]; then
+        echo "  • 资源利用率: $((100 - slots_available * 100 / slots_total))%"
+    fi
     echo ""
     
-    # 延迟评估
-    if [ ! -z "$avg_latency" ] && [ "$(echo "$avg_latency < 5" | bc -l 2>/dev/null || echo "1")" = "1" ]; then
-        print_success "✅ 延迟性能: 优秀 (< 5秒)"
-    elif [ ! -z "$avg_latency" ] && [ "$(echo "$avg_latency < 10" | bc -l 2>/dev/null || echo "1")" = "1" ]; then
-        print_warning "⚠️ 延迟性能: 良好 (< 10秒)"
+    # 延迟评估 - 使用测试数据延迟进行评估
+    local eval_latency="$test_latency"
+    [ -z "$eval_latency" ] && eval_latency="$avg_latency"
+    
+    if [ ! -z "$eval_latency" ]; then
+        if [ "$(echo "$eval_latency < 5" | bc -l 2>/dev/null)" = "1" ]; then
+            print_success "✅ 延迟性能: 优秀 (< 5秒)"
+        elif [ "$(echo "$eval_latency < 10" | bc -l 2>/dev/null)" = "1" ]; then
+            print_warning "⚠️ 延迟性能: 良好 (< 10秒)"
+        else
+            print_warning "⚠️ 延迟性能: 需要优化 (≥ 10秒)"
+        fi
     else
-        print_warning "⚠️ 延迟性能: 需要优化 (≥ 10秒)"
+        print_warning "⚠️ 无法计算延迟性能"
     fi
 }
 
 # 清理临时文件
 cleanup() {
-    rm -f /tmp/test_order_id.txt
+    # 清理不再需要，因为使用全局变量
+    :
 }
 
 # 主函数

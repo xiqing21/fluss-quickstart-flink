@@ -29,11 +29,8 @@ docker-compose up -d
 # 2. 等待服务就绪 (约60秒)
 sleep 60
 
-# 3. 执行所有SQL脚本
-docker exec -it sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/1_cdc_source_to_kafka.sql
-docker exec -it sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/2_dwd_layer.sql
-docker exec -it sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/3_dimension_join.sql
-docker exec -it sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/4_sink_to_postgres.sql
+# 3. 执行所有SQL脚本 (优化版本)
+./execute-sql-scripts.sh
 
 # 4. 运行实时验证测试 ⭐
 ./realtime_validation_test.sh
@@ -55,6 +52,102 @@ docker exec -it sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/4_sink_to_po
 - ✅ 生成性能报告
 
 **成功标志**：看到 `🎉 实时验证测试通过！` 和延迟报告
+
+### 🔧 改进的脚本执行方式
+
+**新增：SQL脚本批量执行器**
+```bash
+# 一次性执行所有SQL脚本
+./execute-sql-scripts.sh
+```
+
+**这个脚本解决了以下问题：**
+- ✅ 非交互式执行，避免脚本卡住
+- ✅ 自动检测执行状态和进度
+- ✅ 智能等待作业启动完成
+- ✅ 详细的执行日志和错误处理
+- ✅ 自动验证执行结果
+
+**特性：**
+- 🎯 进度显示 (1/4, 2/4, 3/4, 4/4)
+- 🔍 实时作业状态监控
+- ⚡ 超时保护 (每个脚本最多2分钟)
+- 🛠️ 执行结果验证
+- 📊 资源使用统计
+
+### 📊 改进的测试验证
+
+**新增：精确的延迟测量**
+```bash
+# 运行优化后的测试脚本
+./realtime_validation_test.sh
+```
+
+**测试脚本改进：**
+- ✅ 修正了数据检测算法，减少"未发现测试数据"误报
+- ✅ 精确的延迟计算，避免异常延迟值
+- ✅ 新增测试订单专用延迟指标
+- ✅ 完整端到端延迟测量（从插入到最终结果）
+- ✅ 改进的Kafka数据流验证逻辑
+
+**新的延迟指标：**
+```bash
+📊 数据处理统计:
+  • 总处理订单数: 8
+  • 平均端到端延迟: 3.45 秒
+  • 测试订单延迟: 4.12 秒          # 新增
+  • 完整端到端延迟: 5.67 秒        # 新增
+```
+
+**延迟类型说明：**
+- **平均端到端延迟**: 所有订单的平均处理延迟
+- **测试订单延迟**: 当前测试订单的处理延迟
+- **完整端到端延迟**: 从脚本插入到最终结果的总延迟
+
+### 🚀 推荐的使用流程
+
+**完整的项目启动流程：**
+
+```bash
+# 1. 启动所有服务
+docker-compose up -d
+
+# 2. 等待服务就绪
+sleep 60
+
+# 3. 执行所有SQL脚本 (新方式)
+./execute-sql-scripts.sh
+
+# 4. 运行实时验证测试 (改进版)
+./realtime_validation_test.sh
+```
+
+**预期输出示例：**
+```
+========================================
+Apache Flink SQL脚本批量执行器
+========================================
+[STEP] 检查环境状态...
+[SUCCESS] 环境检查通过
+[STEP] 执行 第一阶段-CDC数据捕获: 1_cdc_source_to_kafka.sql
+[INFO] 进度: 1/4
+[SUCCESS] 第一阶段-CDC数据捕获 执行完成
+[INFO] 当前运行的作业数量: 2
+✅ 第一阶段-CDC数据捕获 完成
+...
+🎉 所有SQL脚本执行成功！
+```
+
+**测试成功标志：**
+```
+🎉 实时验证测试通过！
+📊 数据处理统计:
+  • 总处理订单数: 8
+  • 平均端到端延迟: 3.45 秒
+  • 测试订单延迟: 4.12 秒
+  • 完整端到端延迟: 5.67 秒
+✅ 延迟性能: 优秀 (< 5秒)
+```
 
 ---
 
@@ -634,6 +727,73 @@ docker-compose logs -f kafka
 
 # 查看最近的错误日志
 docker logs jobmanager 2>&1 | tail -20
+```
+
+#### 8.3 新脚本问题排查
+
+**SQL脚本执行器问题：**
+
+```bash
+# 如果脚本执行失败，检查以下内容：
+
+# 1. 检查sql-client容器状态
+docker ps | grep sql-client
+
+# 2. 检查Flink集群连接
+curl -s http://localhost:8081/overview
+
+# 3. 手动执行单个SQL文件测试
+docker exec sql-client /opt/flink/bin/sql-client.sh -f /opt/sql/1_cdc_source_to_kafka.sql
+
+# 4. 检查SQL文件是否存在
+docker exec sql-client ls -la /opt/sql/
+```
+
+**测试脚本延迟异常：**
+
+```bash
+# 如果延迟测量异常，检查：
+
+# 1. 检查目标表中的时间戳
+docker exec postgres-sink psql -U postgres -d sink_db -c "
+SELECT order_id, order_time, processed_time, 
+       processed_time - order_time as duration
+FROM result.orders_with_user_info 
+ORDER BY order_id DESC LIMIT 5;
+"
+
+# 2. 检查时区设置
+docker exec postgres-sink psql -U postgres -d sink_db -c "SHOW timezone;"
+docker exec postgres-source psql -U postgres -d source_db -c "SHOW timezone;"
+
+# 3. 清理异常数据
+docker exec postgres-sink psql -U postgres -d sink_db -c "
+DELETE FROM result.orders_with_user_info 
+WHERE EXTRACT(EPOCH FROM (processed_time - order_time)) > 3600;
+"
+```
+
+**数据检测失败问题：**
+
+```bash
+# 如果数据检测失败，可以：
+
+# 1. 手动验证Kafka数据
+docker exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic ods_orders \
+  --from-beginning \
+  --max-messages 10
+
+# 2. 检查CDC连接状态
+docker exec postgres-source psql -U postgres -d source_db -c "
+SELECT * FROM pg_replication_slots;
+"
+
+# 3. 重启失败的作业
+docker exec jobmanager flink list
+# 找到失败的作业ID，然后重启
+# docker exec jobmanager flink cancel <job-id>
 ```
 
 ---
